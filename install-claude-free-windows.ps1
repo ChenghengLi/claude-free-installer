@@ -16,6 +16,10 @@
 # Idempotent — re-running it skips already-done steps.
 
 $ErrorActionPreference = "Stop"
+# PowerShell treats native-command stderr (uv progress, git clone status, etc.)
+# as terminating errors when ErrorActionPreference is "Stop". Disable that
+# behaviour for native commands. Variable exists in PS 7.3+; ignored on 5.1.
+try { $PSNativeCommandUseErrorActionPreference = $false } catch {}
 
 function Step($msg)  { Write-Host ""; Write-Host "==> $msg" -ForegroundColor Cyan -NoNewline; Write-Host "" }
 function Ok($msg)    { Write-Host " OK  $msg" -ForegroundColor Green }
@@ -106,16 +110,22 @@ Ok "fzf ready"
 # ----------------------------------------------------------------------------
 Step "6/8  Cloning free-claude-code + uv sync"
 if (-not (Test-Path (Join-Path $Repo ".git"))) {
-    git clone https://github.com/Alishahryar1/free-claude-code.git $Repo
+    # git writes its progress to stderr; wrap via cmd.exe to silence stderr
+    # cleanly under PowerShell 5.1's strict-error mode.
+    cmd /c "git clone https://github.com/Alishahryar1/free-claude-code.git `"$Repo`" 2>NUL"
+    if ($LASTEXITCODE -ne 0) { Errm "git clone failed (exit $LASTEXITCODE)"; exit 1 }
 } else {
     Write-Host "repo already at $Repo"
 }
 Push-Location $Repo
 try {
-    & uv python install 3.14 2>&1 | Out-Null
+    Write-Host "Installing Python 3.14 via uv (downloads ~22 MB on first run)..."
+    # Redirect stderr to $null so uv's progress messages don't trigger
+    # PowerShell 5.1's NativeCommandError under ErrorActionPreference=Stop.
+    cmd /c "uv python install 3.14 2>NUL"
     Write-Host "Running uv sync (may take a minute on first run)..."
-    & uv sync --quiet
-    if ($LASTEXITCODE -ne 0) { & uv sync }
+    cmd /c "uv sync --quiet 2>NUL"
+    if ($LASTEXITCODE -ne 0) { cmd /c "uv sync 2>NUL" }
     if (-not (Test-Path (Join-Path $Repo "nvidia_nim_models.json"))) {
         try {
             Invoke-WebRequest -Uri "https://integrate.api.nvidia.com/v1/models" `
