@@ -51,6 +51,30 @@ After install, open a new shell (or `source ~/.bashrc` / `~/.zshrc`) and run:
 claude-free
 ```
 
+### Windows (PowerShell)
+
+Open a PowerShell window and run:
+
+```powershell
+irm https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/install-claude-free-windows.ps1 | iex
+```
+
+Prerequisites: [Git for Windows](https://git-scm.com/download/win) and [Python 3](https://www.python.org/downloads/windows/) (with "Add to PATH" ticked).
+
+If PowerShell complains about execution policy, run once:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+After install, open a **new** terminal so PATH refreshes, then:
+
+```powershell
+claude-free
+```
+
+(WSL users — use the Ubuntu installer instead, it's simpler.)
+
 ## Notes
 
 - **The `/model` dialog inside Claude Code still shows "Opus 4.7", "Sonnet 4.6", "Haiku 4.5"** — those names are baked into the Claude Code binary and cannot be relabeled. Only the routing is overridden. The launcher prints the real NVIDIA model on every start; `claude-free models` shows the current mapping.
