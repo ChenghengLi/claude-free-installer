@@ -214,11 +214,16 @@ read_env() {
 }
 
 is_proxy_up() {
-  (exec 3<>/dev/tcp/127.0.0.1/"$PORT") >/dev/null 2>&1 && {
-    exec 3>&- 2>/dev/null || true
-    exec 3<&- 2>/dev/null || true
-    return 0
-  }
+  : </dev/tcp/127.0.0.1/"$PORT" >/dev/null 2>&1 && return 0
+  if command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1 && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(0.5)
+try: s.connect(('127.0.0.1', $PORT)); s.close()
+except Exception: sys.exit(1)" >/dev/null 2>&1 && return 0
+  fi
   return 1
 }
 
