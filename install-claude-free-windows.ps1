@@ -213,8 +213,11 @@ function Start-Proxy {
     Push-Location $Repo
     try {
         Write-Host "starting proxy on :$Port (log: $LogFile)" -ForegroundColor DarkGray
-        $proc = Start-Process -FilePath "uv" -ArgumentList @("run","uvicorn","server:app","--host","127.0.0.1","--port","$Port") `
-            -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError $LogFile -PassThru
+        # Start-Process refuses to redirect stdout & stderr to the same file,
+        # so route through cmd.exe and let the shell do the redirect (>log 2>&1).
+        $cmdLine = "uv run uvicorn server:app --host 127.0.0.1 --port $Port > `"$LogFile`" 2>&1"
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $cmdLine) `
+            -WindowStyle Hidden -PassThru
         $proc.Id | Out-File -FilePath $PidFile -Encoding ascii
         for ($i=0; $i -lt 80; $i++) {
             Start-Sleep -Milliseconds 250
@@ -233,12 +236,17 @@ function Start-Proxy {
 
 function Stop-Proxy {
     if (Test-Path $PidFile) {
-        $procId = Get-Content $PidFile
-        try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch {}
+        $procId = (Get-Content $PidFile).Trim()
+        # /T = kill the process tree (cmd.exe -> uv -> uvicorn -> python)
+        # /F = force; redirect to NUL so a missing pid doesn't print scary text
+        cmd /c "taskkill /PID $procId /T /F >NUL 2>NUL"
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
         Write-Host "stopped pid $procId" -ForegroundColor Green
     }
-    Get-Process -Name "uvicorn" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Belt + suspenders: kill any stray python.exe whose command line contains uvicorn
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match "uvicorn" } |
+        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 }
 
 function Show-Models {
