@@ -188,7 +188,10 @@ read_env() {
 }
 
 is_proxy_up() {
-  : </dev/tcp/127.0.0.1/"$PORT" >/dev/null 2>&1 && return 0
+  # Subshell wrap for /dev/tcp — on macOS bash 3.2 the shell prints
+  # "connect: Connection refused" to stderr on a failed redirect even
+  # with 2>/dev/null. Subshell + outer redirect catches it cleanly.
+  ( : </dev/tcp/127.0.0.1/"$PORT" ) >/dev/null 2>&1 && return 0
   if command -v nc >/dev/null 2>&1; then
     nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1 && return 0
   fi
