@@ -81,7 +81,25 @@ Read the full design — the math, why early-exit, when to use audit vs calibrat
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — the benchmark table, sources, methodology, how to submit updates
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — runtime issues: 429s, cold starts, proxy crashes, .env confusion
 - [docs/FAQ.md](docs/FAQ.md) — short answers to common questions
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — repo layout, the `src/` package, provider plugin seam, dev workflow
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each commit
+
+## For developers
+
+The audit script is now a proper Python package under [`src/claude_free/`](src/claude_free/) with a [provider plugin layer](docs/ARCHITECTURE.md#provider-abstraction), a [build script](tools/build.py) that bundles to the single deployed `claude-free-audit.py`, and [tests](tests/).
+
+```bash
+git clone https://github.com/ChenghengLi/claude-free-installer
+cd claude-free-installer
+pip install -e ".[dev]"
+
+pytest                              # 27 tests, all green
+python -m claude_free audit --help  # run the package directly
+python tools/build.py               # regenerate claude-free-audit.py from src/
+python tools/build.py --check       # CI: exit 1 if it's stale
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full layout, how the bundler works, and how to add a new provider or subcommand.
 
 ## Notes
 
