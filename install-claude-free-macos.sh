@@ -177,7 +177,15 @@ setenv MODEL                 "nvidia_nim/minimaxai/minimax-m2.5"
 ok ".env configured"
 
 # ----------------------------------------------------------------------------
-step "8/8  Installing claude-free launcher to $LOCAL_BIN/claude-free"
+step "8/8  Installing claude-free launcher + audit script to $LOCAL_BIN"
+
+# --- audit script (used by `claude-free audit` / `claude-free calibrate`) ---
+AUDIT_URL="https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/claude-free-audit.py"
+if ! curl -fsSL "$AUDIT_URL" -o "$LOCAL_BIN/claude-free-audit.py"; then
+  warn "couldn't fetch claude-free-audit.py from $AUDIT_URL — `claude-free audit` won't work until you do"
+fi
+chmod +x "$LOCAL_BIN/claude-free-audit.py" 2>/dev/null || true
+
 cat > "$LOCAL_BIN/claude-free" <<'CLAUDE_FREE_EOF'
 #!/usr/bin/env bash
 # claude-free — launch Claude Code through the free-claude-code NVIDIA NIM proxy.
@@ -185,6 +193,9 @@ cat > "$LOCAL_BIN/claude-free" <<'CLAUDE_FREE_EOF'
 # Subcommands:
 #   claude-free [args...]   start proxy if needed, launch claude (default model from .env)
 #   claude-free pick        interactive NVIDIA NIM model picker (fzf), then launch
+#   claude-free audit       probe NVIDIA NIM models for TTFT + code benchmarks, rank them
+#   claude-free calibrate   walk models by code-score, pick first with TTFT <= 1s, set .env
+#   claude-free update      refresh the audit script + benchmarks table from GitHub
 #   claude-free rate        show NVIDIA rate-limit hits from proxy log (replaces /usage)
 #   claude-free logs        tail the proxy log
 #   claude-free status      check whether proxy is running and show current model
@@ -309,14 +320,24 @@ print_help() {
 ${B}claude-free${N} — Claude Code via the free-claude-code NVIDIA NIM proxy
 
 ${B}usage:${N}
-  claude-free [args...]   start proxy if needed, launch claude (passes args through)
-  claude-free pick        interactive NVIDIA NIM model picker (fzf), then launch
-  claude-free rate        show NVIDIA rate-limit hits from proxy log (replaces /usage)
-  claude-free logs        tail the proxy log
-  claude-free status      check whether proxy is running and show /model tier mapping
-  claude-free models      same as status — the /model tier -> NVIDIA model mapping
-  claude-free stop        kill the running proxy
-  claude-free help        this help
+  ${B}claude-free${N} [args...]    start proxy if needed, launch claude (passes args through)
+  ${B}claude-free pick${N}         interactive NVIDIA NIM model picker (fzf), then launch
+  ${B}claude-free audit${N}        probe NIM chat models for TTFT + code benchmarks, rank them
+                          flags: --all  --filter <s>  --include <id>  --runs N
+                                 --by {combined,ttft,code}  --tau MS  --rate REQ_MIN
+                                 --early-exit  --threshold MS  --set  --no-set
+  ${B}claude-free calibrate${N}    walk models by code-score, pick the first with TTFT <= 1s
+                          and write it to .env. takes the same flags as audit, e.g.:
+                            claude-free calibrate --threshold 500
+                            claude-free calibrate --filter qwen
+  ${B}claude-free update${N}       refresh ~/.local/bin/claude-free-audit.py from GitHub
+                          (gets you new models + updated benchmark scores)
+  ${B}claude-free rate${N}         show NVIDIA rate-limit hits from proxy log (replaces /usage)
+  ${B}claude-free logs${N}         tail the proxy log
+  ${B}claude-free status${N}       check whether proxy is running and show /model tier mapping
+  ${B}claude-free models${N}       same as status — the /model tier -> NVIDIA model mapping
+  ${B}claude-free stop${N}         kill the running proxy
+  ${B}claude-free help${N}         this help
 
 ${B}config:${N} $ENV_FILE
 ${B}log:${N}    $LOG_FILE
@@ -338,12 +359,51 @@ fi
 TOKEN="$(read_env ANTHROPIC_AUTH_TOKEN)"
 TOKEN="${TOKEN:-freecc}"
 
+AUDIT_SCRIPT="$HOME/.local/bin/claude-free-audit.py"
+
 case "${1:-}" in
   pick)
     shift || true
     start_proxy || exit 1
     cd "$REPO_DIR"
     exec ./claude-pick "$@"
+    ;;
+  audit)
+    shift || true
+    if [[ ! -f "$AUDIT_SCRIPT" ]]; then
+      echo "${R}audit script missing at $AUDIT_SCRIPT${N}" >&2
+      echo "${D}re-run the installer or fetch:${N}" >&2
+      echo "  curl -fsSL https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/claude-free-audit.py -o '$AUDIT_SCRIPT'" >&2
+      exit 1
+    fi
+    exec python3 "$AUDIT_SCRIPT" "$@"
+    ;;
+  calibrate)
+    shift || true
+    if [[ ! -f "$AUDIT_SCRIPT" ]]; then
+      echo "${R}audit script missing at $AUDIT_SCRIPT${N}" >&2
+      echo "${D}fix: claude-free update${N}" >&2
+      exit 1
+    fi
+    # `calibrate` = walk benchmarked models top-down by code-score, pick the
+    # first one whose TTFT is <= 1000ms, write it to .env. Forwards extras so
+    # the user can still pass --threshold / --filter / --runs etc.
+    exec python3 "$AUDIT_SCRIPT" --set --early-exit --threshold 1000 "$@"
+    ;;
+  update)
+    shift || true
+    URL="https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/claude-free-audit.py"
+    echo "${B}claude-free update${N}  ${D}— refreshing audit script + benchmarks table${N}"
+    echo "  fetching $URL"
+    if curl -fsSL "$URL" -o "$AUDIT_SCRIPT.new"; then
+      mv "$AUDIT_SCRIPT.new" "$AUDIT_SCRIPT"
+      chmod +x "$AUDIT_SCRIPT" 2>/dev/null || true
+      echo "${G}updated $AUDIT_SCRIPT${N}"
+    else
+      rm -f "$AUDIT_SCRIPT.new"
+      echo "${R}fetch failed — keeping existing script${N}" >&2
+      exit 1
+    fi
     ;;
   rate|usage|limits)
     show_rate
@@ -418,6 +478,9 @@ echo
 echo "  Run Claude Code with NVIDIA NIM:   ${B}claude-free${N}"
 echo "  Show active model mapping:         ${B}claude-free models${N}"
 echo "  Switch model interactively:        ${B}claude-free pick${N}"
+echo "  Audit models (latency + code):     ${B}claude-free audit${N}"
+echo "  Auto-pick fastest good model:      ${B}claude-free calibrate${N}"
+echo "  Refresh audit script + benchmarks: ${B}claude-free update${N}"
 echo "  Show rate-limit usage:             ${B}claude-free rate${N}"
 echo "  Stop the proxy:                    ${B}claude-free stop${N}"
 echo "  Help:                              ${B}claude-free help${N}"

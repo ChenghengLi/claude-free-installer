@@ -165,7 +165,16 @@ Set-EnvKvp $envFile "MODEL"                "nvidia_nim/minimaxai/minimax-m2.5"
 Ok ".env configured"
 
 # ----------------------------------------------------------------------------
-Step "8/8  Installing claude-free.ps1 launcher to $LocalBin"
+Step "8/8  Installing claude-free.ps1 launcher + audit script to $LocalBin"
+
+# --- audit script (used by `claude-free audit` / `claude-free calibrate`) ---
+$auditUrl  = "https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/claude-free-audit.py"
+$auditPath = Join-Path $LocalBin "claude-free-audit.py"
+try {
+    Invoke-WebRequest -Uri $auditUrl -OutFile $auditPath -UseBasicParsing
+} catch {
+    Warn "couldn't fetch claude-free-audit.py from $auditUrl -- ``claude-free audit`` won't work until you do"
+}
 
 $launcherPath = Join-Path $LocalBin "claude-free.ps1"
 $launcher = @'
@@ -174,6 +183,9 @@ $launcher = @'
 # Subcommands:
 #   claude-free                  start proxy if needed, launch claude
 #   claude-free pick             interactive NVIDIA NIM model picker (fzf)
+#   claude-free audit            probe NVIDIA NIM models for TTFT + code benchmarks
+#   claude-free calibrate        walk by code-score, pick first with TTFT <= 1s, set .env
+#   claude-free update           refresh the audit script + benchmarks table from GitHub
 #   claude-free models / status  show /model tier mapping + proxy status
 #   claude-free stop             kill the running proxy
 #   claude-free logs             show proxy log
@@ -271,6 +283,17 @@ claude-free — Claude Code via the free-claude-code NVIDIA NIM proxy
 usage:
   claude-free                  start proxy if needed, launch claude
   claude-free pick             interactive NVIDIA NIM model picker (fzf)
+  claude-free audit            probe NIM chat models for TTFT + code benchmarks
+                               flags: --all  --filter <s>  --include <id>  --runs N
+                                      --by {combined,ttft,code}  --tau MS
+                                      --rate REQ_MIN  --early-exit  --threshold MS
+                                      --set  --no-set
+  claude-free calibrate        walk models by code-score, pick first with TTFT <= 1s
+                               and write it to .env. Same flags as audit, e.g.:
+                                 claude-free calibrate --threshold 500
+                                 claude-free calibrate --filter qwen
+  claude-free update           refresh ~/.local/bin/claude-free-audit.py from GitHub
+                               (gets you new models + updated benchmark scores)
   claude-free models|status    show /model tier mapping + proxy status
   claude-free stop             kill the running proxy
   claude-free logs             show last 80 lines of the proxy log
@@ -293,12 +316,61 @@ if (-not $key) {
 $token = Read-Env "ANTHROPIC_AUTH_TOKEN"
 if (-not $token) { $token = "freecc" }
 
+$AuditScript = Join-Path $HOME ".local\bin\claude-free-audit.py"
+function Get-PyExe {
+    if (Get-Command python  -ErrorAction SilentlyContinue) { return "python"  }
+    if (Get-Command python3 -ErrorAction SilentlyContinue) { return "python3" }
+    return $null
+}
+
 $cmd = if ($args.Count -gt 0) { $args[0] } else { "" }
 switch -Regex ($cmd) {
     "^pick$" {
         if (-not (Start-Proxy)) { exit 1 }
         Push-Location $Repo
         try { & bash ./claude-pick @($args | Select-Object -Skip 1) } finally { Pop-Location }
+    }
+    "^audit$" {
+        if (-not (Test-Path $AuditScript)) {
+            Write-Host "audit script missing at $AuditScript" -ForegroundColor Red
+            Write-Host "re-run the installer or fetch:" -ForegroundColor DarkGray
+            Write-Host "  iwr https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/claude-free-audit.py -OutFile `"$AuditScript`""
+            exit 1
+        }
+        $py = Get-PyExe
+        if (-not $py) { Write-Host "python is not on PATH" -ForegroundColor Red; exit 1 }
+        & $py $AuditScript @($args | Select-Object -Skip 1)
+        exit $LASTEXITCODE
+    }
+    "^calibrate$" {
+        if (-not (Test-Path $AuditScript)) {
+            Write-Host "audit script missing at $AuditScript" -ForegroundColor Red
+            Write-Host "fix: claude-free update" -ForegroundColor DarkGray
+            exit 1
+        }
+        $py = Get-PyExe
+        if (-not $py) { Write-Host "python is not on PATH" -ForegroundColor Red; exit 1 }
+        # `calibrate` = walk benchmarked models top-down by code-score, pick
+        # the first one whose TTFT is <= 1000ms, write to .env. Forwards extras
+        # so users can pass --threshold / --filter / --runs / etc.
+        & $py $AuditScript "--set" "--early-exit" "--threshold" "1000" @($args | Select-Object -Skip 1)
+        exit $LASTEXITCODE
+    }
+    "^update$" {
+        $url = "https://raw.githubusercontent.com/ChenghengLi/claude-free-installer/main/claude-free-audit.py"
+        Write-Host "claude-free update -- refreshing audit script + benchmarks table" -ForegroundColor Cyan
+        Write-Host "  fetching $url"
+        $tmp = "$AuditScript.new"
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+            Move-Item -Path $tmp -Destination $AuditScript -Force
+            Write-Host "updated $AuditScript" -ForegroundColor Green
+        } catch {
+            if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+            Write-Host "fetch failed -- keeping existing script" -ForegroundColor Red
+            Write-Host $_.Exception.Message
+            exit 1
+        }
     }
     "^(stop|kill)$" { Stop-Proxy }
     "^(status|models)$" { Show-Models }
@@ -347,6 +419,9 @@ Write-Host ""
 Write-Host "    claude-free               (launch Claude Code via NVIDIA NIM)"
 Write-Host "    claude-free models        (show active /model mapping)"
 Write-Host "    claude-free pick          (interactive model picker)"
+Write-Host "    claude-free audit         (rank NIM models by latency + code benchmarks)"
+Write-Host "    claude-free calibrate     (auto-pick the fastest good model)"
+Write-Host "    claude-free update        (refresh audit script + benchmarks table)"
 Write-Host "    claude-free stop          (kill the proxy)"
 Write-Host "    claude-free help          (full help)"
 Write-Host ""
