@@ -37,7 +37,7 @@ from typing import Optional, Protocol
 # === __init__.py
 # ============================================================
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Last-refreshed marker for the BENCHMARKS table — keep in sync with
 # benchmarks.py. Used by the build script to stamp the generated file.
@@ -137,13 +137,24 @@ def write_env_key(path: Path, key: str, value: str) -> None:
         txt += line + "\n"
     path.write_text(txt, encoding="utf-8")
 
-def resolve_api_key() -> Optional[str]:
-    """Look up the NVIDIA key from env vars, then the .env file."""
-    for var in ("NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
-        v = os.environ.get(var)
+def resolve_api_key(provider: str = "nvidia-nim") -> Optional[str]:
+    """Look up the API key for `provider` from env vars, then the .env file.
+
+    nvidia-nim   ->  $NVIDIA_NIM_API_KEY > $NVIDIA_API_KEY > .env NVIDIA_NIM_API_KEY
+    openrouter   ->  $OPENROUTER_API_KEY > .env OPENROUTER_API_KEY
+    """
+    if provider == "nvidia-nim":
+        for var in ("NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
+            v = os.environ.get(var)
+            if v:
+                return v
+        return read_env_key(env_path(), "NVIDIA_NIM_API_KEY")
+    if provider == "openrouter":
+        v = os.environ.get("OPENROUTER_API_KEY")
         if v:
             return v
-    return read_env_key(env_path(), "NVIDIA_NIM_API_KEY")
+        return read_env_key(env_path(), "OPENROUTER_API_KEY")
+    return None
 
 # ============================================================
 # === benchmarks.py
@@ -256,16 +267,65 @@ def code_score_for(model: str) -> Optional[dict]:
     }
 
 def combined_score(code: Optional[float], ttft_ms: Optional[int], tau_ms: float) -> Optional[float]:
-    """Combine quality + speed. Higher = better.
+    """Combine quality + speed using TTFT only. Higher = better.
 
-    smart = code_score * exp(-TTFT_ms / tau_ms)
+    combined = code_score * exp(-TTFT_ms / tau_ms)
 
     At TTFT=tau, you keep ~37% of the model's quality score. tau=3000ms means
     a 3s TTFT discounts a model heavily, while sub-300ms keeps ~90% of credit.
+
+    This formula ignores tok/s (post-TTFT generation speed). For a metric
+    that accounts for both, use smart_score().
     """
     if code is None or ttft_ms is None:
         return None
     return code * math.exp(-ttft_ms / tau_ms)
+
+# Floor for measured tok/s in smart_score. Our probes use max_tokens=16, which
+# makes tok/s readings noisy — a real production model averaging 80 tok/s might
+# look like 2 tok/s on the probe because the first few chunks dominate.
+# Treating anything below this floor as "the floor" prevents probe noise from
+# tanking otherwise-good models. Real models on free NIM stream at 10+ tok/s
+# steady-state once warmed up.
+_TOK_PER_S_FLOOR = 10.0
+
+def smart_score(
+    code: Optional[float],
+    ttft_ms: Optional[int],
+    tok_per_s: Optional[float],
+    tau_ms: float,
+    output_tokens: int = 200,
+) -> Optional[float]:
+    """Combine quality + end-to-end response time. Higher = better.
+
+    smart = code_score * exp(-effective_ms / tau_ms)
+    where effective_ms = TTFT_ms + (output_tokens / max(tok_per_s, FLOOR)) * 1000
+
+    Models the user's wait for a typical Claude Code response (default 200
+    output tokens — medium response length). A model with great TTFT but
+    abnormally slow throughput gets penalized just like one with poor TTFT
+    — both leave the user staring at the screen.
+
+    The tok/s floor (10/s) prevents noisy probe measurements from trashing
+    a model. With max_tokens=16 probes we routinely see 1-3 tok/s for models
+    that stream at 50-200 tok/s in production; the floor stops that from
+    dominating the ranking.
+
+    If tok_per_s is missing entirely, falls back to combined_score (TTFT-only).
+    """
+    if code is None or ttft_ms is None:
+        return None
+    if tok_per_s is None or tok_per_s <= 0:
+        return combined_score(code, ttft_ms, tau_ms)
+    effective_tps = max(tok_per_s, _TOK_PER_S_FLOOR)
+    effective_ms = ttft_ms + (output_tokens / effective_tps) * 1000.0
+    # effective_ms is typically 10-30x larger than ttft_ms (most of the time
+    # is spent generating tokens, not waiting for the first one). Scale tau
+    # by 10 internally so the same --tau value produces sensible numbers for
+    # both combined (TTFT-only) and smart (TTFT + output time). With tau=3000,
+    # smart's effective tau is 30000ms — a 30s end-to-end response keeps 37%.
+    smart_tau = tau_ms * 10
+    return code * math.exp(-effective_ms / smart_tau)
 
 # ============================================================
 # === providers/base.py
@@ -435,12 +495,149 @@ class NvidiaNimProvider:
         }
 
 # ============================================================
+# === providers/openrouter.py
+# ============================================================
+
+PROMPT = "Reply with exactly the single word: pong."
+MAX_TOKENS = 16
+
+class OpenRouterProvider:
+    """OpenAI-compatible client for OpenRouter."""
+
+    name = "openrouter"
+    api_base = "https://openrouter.ai/api/v1"
+    proxy_value_prefix = "openrouter/"
+
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ValueError("OpenRouter API key is required (sk-or-v1-...)")
+        self.api_key = api_key
+        # OpenRouter recommends setting these to attribute usage. They're
+        # optional; we keep the values minimal and override-able from env.
+        self.referer = os.environ.get(
+            "OPENROUTER_HTTP_REFERER",
+            "https://github.com/ChenghengLi/claude-free-installer",
+        )
+        self.app_title = os.environ.get("OPENROUTER_X_TITLE", "claude-free-audit")
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "HTTP-Referer": self.referer,
+            "X-Title": self.app_title,
+        }
+
+    def list_models(self, timeout: float = 15.0) -> list[str]:
+        req = urllib.request.Request(
+            f"{self.api_base}/models",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        return sorted(set(ids))
+
+    def probe(
+        self,
+        model: str,
+        timeout: float,
+        rate_limiter: Optional[RateLimiter] = None,
+        retry_on_429: bool = True,
+    ) -> dict:
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": PROMPT}],
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0,
+            "stream": True,
+        }
+        data = json.dumps(body).encode("utf-8")
+        headers = self._headers()
+        # OpenRouter's chat endpoint is /chat/completions, same shape as OpenAI.
+        req = urllib.request.Request(
+            f"{self.api_base}/chat/completions",
+            data=data,
+            method="POST",
+            headers=headers,
+        )
+        if rate_limiter is not None:
+            rate_limiter.wait()
+        t0 = time.perf_counter()
+        ttft: Optional[float] = None
+        tokens = 0
+        text_parts: list[str] = []
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                for raw in r:
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    # OpenRouter sometimes emits SSE comments (lines starting
+                    # with ":") to keep the connection alive — ignore those.
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        continue
+                    try:
+                        j = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = j.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    chunk = delta.get("content")
+                    if chunk:
+                        if ttft is None:
+                            ttft = time.perf_counter() - t0
+                        tokens += 1
+                        text_parts.append(chunk)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and retry_on_429:
+                ra = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    wait = float(ra) if ra else 5.0
+                except (TypeError, ValueError):
+                    wait = 5.0
+                wait = min(max(wait, 1.0), 30.0)
+                time.sleep(wait)
+                return self.probe(model, timeout, rate_limiter, retry_on_429=False)
+            body_txt = ""
+            try:
+                body_txt = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            return {"model": model, "error": f"HTTP {e.code} {body_txt}"}
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+                return {"model": model, "error": f"timeout >{timeout:.1f}s"}
+            return {"model": model, "error": f"URL {reason}"}
+        except TimeoutError:
+            return {"model": model, "error": f"timeout >{timeout:.1f}s"}
+        except Exception as e:  # noqa: BLE001
+            return {"model": model, "error": f"{type(e).__name__}: {e}"}
+        total = time.perf_counter() - t0
+        return {
+            "model": model,
+            "ttft_ms": int(ttft * 1000) if ttft is not None else None,
+            "total_ms": int(total * 1000),
+            "tokens": tokens,
+            "tok_per_s": round(tokens / total, 1) if tokens and total > 0 else None,
+            "sample": "".join(text_parts)[:60],
+        }
+
+# ============================================================
 # === providers/__init__.py
 # ============================================================
 
 # Registry of available providers. Keys are CLI-friendly short names.
 _PROVIDERS: dict[str, type[Provider]] = {
     "nvidia-nim": NvidiaNimProvider,
+    "openrouter": OpenRouterProvider,
 }
 
 def register_providers() -> dict[str, type[Provider]]:
@@ -621,6 +818,7 @@ def _early_exit_path(
             print(f"{C['R']}{r['error'][:60]}{C['N']}")
             continue
         r["combined"] = combined_score(cs, r.get("ttft_ms"), args.tau)
+        r["smart"] = smart_score(cs, r.get("ttft_ms"), r.get("tok_per_s"), args.tau, args.output_tokens)
         ttft = r["ttft_ms"]
         ok_speed = ttft is not None and ttft <= threshold
         tag = f"{C['G']}WINNER{C['N']}" if ok_speed else f"{C['Y']}slow{C['N']}"
@@ -681,7 +879,7 @@ def _full_sweep_path(
     width = min(width, 55)
     header = (
         f"  {'MODEL':<{width}}  {'TTFT(ms)':>10}  {'TOK/S':>7}  "
-        f"{'CODE':>6}  {'COMBINED':>9}  SRC"
+        f"{'CODE':>6}  {'SMART':>7}  SRC"
     )
     print(f"{C['B']}{header}{C['N']}")
     print("  " + "-" * (width + 50))
@@ -703,17 +901,21 @@ def _full_sweep_path(
             print(f"{C['R']}ERROR{C['N']}  {r['error'][:80]}")
         else:
             r["combined"] = combined_score(r.get("code_score"), r.get("ttft_ms"), args.tau)
+            r["smart"] = smart_score(
+                r.get("code_score"), r.get("ttft_ms"), r.get("tok_per_s"),
+                args.tau, args.output_tokens,
+            )
             cs = r.get("code_score")
-            cb = r.get("combined")
+            sm = r.get("smart")
             cs_str = f"{cs:.1f}" if cs is not None else "-"
-            cb_str = f"{cb:.1f}" if cb is not None else "-"
+            sm_str = f"{sm:.1f}" if sm is not None else "-"
             tok = r.get("tok_per_s")
             tok_str = f"{tok}" if tok is not None else "-"
             print(
                 f"{r['ttft_ms']:>10}  "
                 f"{tok_str:>7}  "
                 f"{cs_str:>6}  "
-                f"{cb_str:>9}  "
+                f"{sm_str:>7}  "
                 f"{r.get('code_src', '?')}"
             )
         results.append(r)
@@ -745,21 +947,28 @@ def _full_sweep_path(
         [r for r in ok if r.get("combined") is not None],
         key=lambda r: -r["combined"],
     )
+    by_smart = sorted(
+        [r for r in ok if r.get("smart") is not None],
+        key=lambda r: -r["smart"],
+    )
 
     _print_ranking("Lowest TTFT", by_ttft, lambda r: r["ttft_ms"], "ms")
     if by_code:
         _print_ranking("Best code-benchmark score", by_code, lambda r: r["code_score"], "pts")
-    if by_combined:
+    if by_smart:
         _print_ranking(
-            f"Combined fast+good (tau={args.tau:.0f}ms)",
-            by_combined,
-            lambda r: r["combined"],
+            f"Smart score (TTFT + {args.output_tokens} output tokens, tau={args.tau:.0f}ms)",
+            by_smart,
+            lambda r: r["smart"],
             "score",
         )
 
-    if args.by == "combined" and by_combined:
+    if args.by == "smart" and by_smart:
+        winner_record = by_smart[0]
+        ranking_used = "smart (TTFT + output time)"
+    elif args.by == "combined" and by_combined:
         winner_record = by_combined[0]
-        ranking_used = "combined fast+good"
+        ranking_used = "combined (TTFT only)"
     elif args.by == "code" and by_code:
         winner_record = by_code[0]
         ranking_used = "code benchmark"
@@ -769,7 +978,7 @@ def _full_sweep_path(
         if args.by != "ttft":
             print(
                 f"\n{C['Y']}note: --by {args.by} had no eligible models "
-                f"(missing benchmark data); falling back to TTFT.{C['N']}"
+                f"(missing benchmark / throughput data); falling back to TTFT.{C['N']}"
             )
 
     winner = winner_record["model"]
@@ -840,15 +1049,24 @@ def _build_audit_parser(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-warmup", action="store_true", help="skip the warmup probe")
     p.add_argument(
         "--by",
-        choices=("combined", "ttft", "code"),
-        default="combined",
-        help="rank winner by: combined (default, fast+good), ttft (fastest), or code (best benchmarks)",
+        choices=("smart", "combined", "ttft", "code"),
+        default="smart",
+        help=(
+            "rank winner by: smart (default, code * exp(-(TTFT + output/tok_per_s) / tau)), "
+            "combined (TTFT-only variant), ttft (fastest), or code (best benchmarks)"
+        ),
     )
     p.add_argument(
         "--tau",
         type=float,
         default=3000.0,
         help="latency penalty constant in ms (default 3000). lower = penalize slow models harder",
+    )
+    p.add_argument(
+        "--output-tokens",
+        type=int,
+        default=200,
+        help="typical response length used by smart_score (default 200 tokens)",
     )
     p.add_argument(
         "--early-exit",
@@ -923,11 +1141,16 @@ def main(argv: list[str]) -> int:
         if not args.auto_set and not args.no_set:
             args.auto_set = True
 
-    api_key = args.key or resolve_api_key()
+    api_key = args.key or resolve_api_key(args.provider)
     if not api_key:
+        env_var = {
+            "nvidia-nim": "NVIDIA_NIM_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }.get(args.provider, args.provider.upper().replace("-", "_") + "_API_KEY")
         print(
-            "No API key found. Set NVIDIA_NIM_API_KEY (or NVIDIA_API_KEY) "
-            "or populate ~/free-claude-code/.env",
+            f"No API key for provider '{args.provider}'. "
+            f"Set ${env_var} or populate ~/free-claude-code/.env, "
+            f"or pass --key.",
             file=sys.stderr,
         )
         return 2

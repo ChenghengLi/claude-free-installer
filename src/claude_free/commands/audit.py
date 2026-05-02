@@ -16,6 +16,7 @@ from claude_free.benchmarks import (
     CURATED,
     code_score_for,
     combined_score,
+    smart_score,
 )
 from claude_free.colors import colors
 from claude_free.env import env_path, write_env_key
@@ -141,6 +142,7 @@ def _early_exit_path(
             print(f"{C['R']}{r['error'][:60]}{C['N']}")
             continue
         r["combined"] = combined_score(cs, r.get("ttft_ms"), args.tau)
+        r["smart"] = smart_score(cs, r.get("ttft_ms"), r.get("tok_per_s"), args.tau, args.output_tokens)
         ttft = r["ttft_ms"]
         ok_speed = ttft is not None and ttft <= threshold
         tag = f"{C['G']}WINNER{C['N']}" if ok_speed else f"{C['Y']}slow{C['N']}"
@@ -202,7 +204,7 @@ def _full_sweep_path(
     width = min(width, 55)
     header = (
         f"  {'MODEL':<{width}}  {'TTFT(ms)':>10}  {'TOK/S':>7}  "
-        f"{'CODE':>6}  {'COMBINED':>9}  SRC"
+        f"{'CODE':>6}  {'SMART':>7}  SRC"
     )
     print(f"{C['B']}{header}{C['N']}")
     print("  " + "-" * (width + 50))
@@ -224,17 +226,21 @@ def _full_sweep_path(
             print(f"{C['R']}ERROR{C['N']}  {r['error'][:80]}")
         else:
             r["combined"] = combined_score(r.get("code_score"), r.get("ttft_ms"), args.tau)
+            r["smart"] = smart_score(
+                r.get("code_score"), r.get("ttft_ms"), r.get("tok_per_s"),
+                args.tau, args.output_tokens,
+            )
             cs = r.get("code_score")
-            cb = r.get("combined")
+            sm = r.get("smart")
             cs_str = f"{cs:.1f}" if cs is not None else "-"
-            cb_str = f"{cb:.1f}" if cb is not None else "-"
+            sm_str = f"{sm:.1f}" if sm is not None else "-"
             tok = r.get("tok_per_s")
             tok_str = f"{tok}" if tok is not None else "-"
             print(
                 f"{r['ttft_ms']:>10}  "
                 f"{tok_str:>7}  "
                 f"{cs_str:>6}  "
-                f"{cb_str:>9}  "
+                f"{sm_str:>7}  "
                 f"{r.get('code_src', '?')}"
             )
         results.append(r)
@@ -266,21 +272,28 @@ def _full_sweep_path(
         [r for r in ok if r.get("combined") is not None],
         key=lambda r: -r["combined"],
     )
+    by_smart = sorted(
+        [r for r in ok if r.get("smart") is not None],
+        key=lambda r: -r["smart"],
+    )
 
     _print_ranking("Lowest TTFT", by_ttft, lambda r: r["ttft_ms"], "ms")
     if by_code:
         _print_ranking("Best code-benchmark score", by_code, lambda r: r["code_score"], "pts")
-    if by_combined:
+    if by_smart:
         _print_ranking(
-            f"Combined fast+good (tau={args.tau:.0f}ms)",
-            by_combined,
-            lambda r: r["combined"],
+            f"Smart score (TTFT + {args.output_tokens} output tokens, tau={args.tau:.0f}ms)",
+            by_smart,
+            lambda r: r["smart"],
             "score",
         )
 
-    if args.by == "combined" and by_combined:
+    if args.by == "smart" and by_smart:
+        winner_record = by_smart[0]
+        ranking_used = "smart (TTFT + output time)"
+    elif args.by == "combined" and by_combined:
         winner_record = by_combined[0]
-        ranking_used = "combined fast+good"
+        ranking_used = "combined (TTFT only)"
     elif args.by == "code" and by_code:
         winner_record = by_code[0]
         ranking_used = "code benchmark"
@@ -290,7 +303,7 @@ def _full_sweep_path(
         if args.by != "ttft":
             print(
                 f"\n{C['Y']}note: --by {args.by} had no eligible models "
-                f"(missing benchmark data); falling back to TTFT.{C['N']}"
+                f"(missing benchmark / throughput data); falling back to TTFT.{C['N']}"
             )
 
     winner = winner_record["model"]

@@ -26,15 +26,24 @@ def _build_audit_parser(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-warmup", action="store_true", help="skip the warmup probe")
     p.add_argument(
         "--by",
-        choices=("combined", "ttft", "code"),
-        default="combined",
-        help="rank winner by: combined (default, fast+good), ttft (fastest), or code (best benchmarks)",
+        choices=("smart", "combined", "ttft", "code"),
+        default="smart",
+        help=(
+            "rank winner by: smart (default, code * exp(-(TTFT + output/tok_per_s) / tau)), "
+            "combined (TTFT-only variant), ttft (fastest), or code (best benchmarks)"
+        ),
     )
     p.add_argument(
         "--tau",
         type=float,
         default=3000.0,
         help="latency penalty constant in ms (default 3000). lower = penalize slow models harder",
+    )
+    p.add_argument(
+        "--output-tokens",
+        type=int,
+        default=200,
+        help="typical response length used by smart_score (default 200 tokens)",
     )
     p.add_argument(
         "--early-exit",
@@ -111,11 +120,16 @@ def main(argv: list[str]) -> int:
         if not args.auto_set and not args.no_set:
             args.auto_set = True
 
-    api_key = args.key or resolve_api_key()
+    api_key = args.key or resolve_api_key(args.provider)
     if not api_key:
+        env_var = {
+            "nvidia-nim": "NVIDIA_NIM_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }.get(args.provider, args.provider.upper().replace("-", "_") + "_API_KEY")
         print(
-            "No API key found. Set NVIDIA_NIM_API_KEY (or NVIDIA_API_KEY) "
-            "or populate ~/free-claude-code/.env",
+            f"No API key for provider '{args.provider}'. "
+            f"Set ${env_var} or populate ~/free-claude-code/.env, "
+            f"or pass --key.",
             file=sys.stderr,
         )
         return 2

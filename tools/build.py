@@ -36,6 +36,7 @@ MODULE_ORDER = [
     "benchmarks.py",
     "providers/base.py",
     "providers/nvidia_nim.py",
+    "providers/openrouter.py",
     "providers/__init__.py",
     "measure.py",
     "commands/__init__.py",

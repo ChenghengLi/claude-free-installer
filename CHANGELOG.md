@@ -2,7 +2,52 @@
 
 All notable changes to this repo. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/), and the project follows pragmatic semver.
 
-## 2026-05-02 — package refactor
+## 0.3.0 — 2026-05-02
+
+Three feature areas land in this release.
+
+### Smart score (`--by smart`)
+
+- New `smart_score(code, ttft, tok_per_s, tau, output_tokens)` — combines code-benchmark quality with **end-to-end response time**, not just TTFT. Formula:
+
+  ```
+  effective_ms = TTFT_ms + (output_tokens / max(tok_per_s, 10)) * 1000
+  smart       = code_score * exp(-effective_ms / (tau * 10))
+  ```
+
+  - The 10 tok/s **floor** prevents noisy probe measurements (we use `max_tokens=16` for the probe, which under-reports steady-state throughput) from trashing otherwise-good models.
+  - tau is scaled internally by 10 so the user's `--tau 3000` produces sensible numbers under both `combined` (TTFT-only) and `smart` (TTFT + output time).
+  - New `--output-tokens N` flag (default 200, the typical Claude Code response length).
+- `smart` is now the **default** for `--by` (was `combined`). `combined` is still available as the TTFT-only fallback.
+- A "Smart score" ranking is now shown in `claude-free audit` output alongside TTFT and code rankings.
+
+### OpenRouter provider — validates the plugin seam
+
+- New provider implementation `src/claude_free/providers/openrouter.py` — OpenAI-compatible client for `https://openrouter.ai/api/v1`. Bearer auth, `proxy_value_prefix="openrouter/"` for litellm routing, optional `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE` env vars.
+- Registered in `providers/__init__.py`. Available now via `--provider openrouter` on `claude-free audit` / `calibrate`.
+- Key resolution: `$OPENROUTER_API_KEY` → `~/free-claude-code/.env` `OPENROUTER_API_KEY`.
+- `resolve_api_key(provider)` now takes the provider name; backwards-compatible defaulting to `nvidia-nim`.
+- New `tests/test_providers.py` — 15 tests covering the registry, the `Provider` Protocol surface, the request/response contract for both providers (mocked urllib).
+
+### Launcher template refactor
+
+- Bash launcher (used by Linux + macOS installers) is now a single source file at `src/launcher/posix.sh`.
+- PowerShell launcher (used by the Windows installer) is at `src/launcher/windows.ps1`.
+- New `tools/build_installers.py` — re-injects the canonical launcher body into the heredoc / here-string region of each installer. `--check` flag for CI.
+- The three installers themselves still live at the repo root (so curl URLs don't change) and contain the launcher inline; the build step keeps them in sync with the canonical source.
+
+### Tests
+
+- 53 passing tests across `test_benchmarks.py` (smart_score added), `test_env.py` (OpenRouter key resolution added), `test_providers.py` (new file, 15 tests), `test_rate_limit.py`.
+
+### Documentation
+
+- `docs/ARCHITECTURE.md` updated with the new launcher template layout.
+- This CHANGELOG entry.
+
+---
+
+## 0.2.0 — 2026-05-02 — package refactor
 
 - Refactor the monolithic `claude-free-audit.py` into a proper Python package under `src/claude_free/`. Modules: `cli`, `colors`, `env`, `rate_limit`, `benchmarks`, `measure`, `providers/{base,nvidia_nim}`, `commands/{audit,update}`. Plus `__init__.py` and `__main__.py`.
 - Add a **provider plugin layer** — `providers/base.py` defines the `Provider` Protocol; `providers/nvidia_nim.py` is today's only implementation; `providers/__init__.py` is the registry. New providers (OpenRouter, Together AI, OpenAI, ...) plug in by adding a module + registering in `__init__.py` + listing in `MODULE_ORDER`.

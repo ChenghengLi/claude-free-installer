@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from claude_free.providers.base import Provider
 from claude_free.providers.nvidia_nim import NvidiaNimProvider
+from claude_free.providers.openrouter import OpenRouterProvider
 
 # Registry of available providers. Keys are CLI-friendly short names.
 _PROVIDERS: dict[str, type[Provider]] = {
     "nvidia-nim": NvidiaNimProvider,
+    "openrouter": OpenRouterProvider,
 }
 
 

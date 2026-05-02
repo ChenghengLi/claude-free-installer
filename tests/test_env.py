@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_free.env import read_env_key, write_env_key
+from claude_free.env import read_env_key, resolve_api_key, write_env_key
 
 
 @pytest.fixture
@@ -68,3 +68,22 @@ class TestWriteEnvKey:
         # in real model ids).
         write_env_key(envfile, "MODEL_OPUS", "nvidia_nim/some/model-with.dots")
         assert read_env_key(envfile, "MODEL_OPUS") == "nvidia_nim/some/model-with.dots"
+
+
+class TestResolveApiKey:
+    def test_nvidia_from_env_var(self, monkeypatch):
+        monkeypatch.setenv("NVIDIA_NIM_API_KEY", "nvapi-from-env")
+        assert resolve_api_key("nvidia-nim") == "nvapi-from-env"
+
+    def test_nvidia_falls_back_to_secondary_env_var(self, monkeypatch):
+        monkeypatch.delenv("NVIDIA_NIM_API_KEY", raising=False)
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secondary")
+        assert resolve_api_key("nvidia-nim") == "nvapi-secondary"
+
+    def test_openrouter_from_env_var(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+        assert resolve_api_key("openrouter") == "sk-or-v1-test"
+
+    def test_unknown_provider_returns_none(self, monkeypatch):
+        # Defensive — caller should handle but resolve shouldn't blow up.
+        assert resolve_api_key("not-a-real-provider") is None

@@ -122,13 +122,64 @@ def code_score_for(model: str) -> Optional[dict]:
 
 
 def combined_score(code: Optional[float], ttft_ms: Optional[int], tau_ms: float) -> Optional[float]:
-    """Combine quality + speed. Higher = better.
+    """Combine quality + speed using TTFT only. Higher = better.
 
-    smart = code_score * exp(-TTFT_ms / tau_ms)
+    combined = code_score * exp(-TTFT_ms / tau_ms)
 
     At TTFT=tau, you keep ~37% of the model's quality score. tau=3000ms means
     a 3s TTFT discounts a model heavily, while sub-300ms keeps ~90% of credit.
+
+    This formula ignores tok/s (post-TTFT generation speed). For a metric
+    that accounts for both, use smart_score().
     """
     if code is None or ttft_ms is None:
         return None
     return code * math.exp(-ttft_ms / tau_ms)
+
+
+# Floor for measured tok/s in smart_score. Our probes use max_tokens=16, which
+# makes tok/s readings noisy — a real production model averaging 80 tok/s might
+# look like 2 tok/s on the probe because the first few chunks dominate.
+# Treating anything below this floor as "the floor" prevents probe noise from
+# tanking otherwise-good models. Real models on free NIM stream at 10+ tok/s
+# steady-state once warmed up.
+_TOK_PER_S_FLOOR = 10.0
+
+
+def smart_score(
+    code: Optional[float],
+    ttft_ms: Optional[int],
+    tok_per_s: Optional[float],
+    tau_ms: float,
+    output_tokens: int = 200,
+) -> Optional[float]:
+    """Combine quality + end-to-end response time. Higher = better.
+
+    smart = code_score * exp(-effective_ms / tau_ms)
+    where effective_ms = TTFT_ms + (output_tokens / max(tok_per_s, FLOOR)) * 1000
+
+    Models the user's wait for a typical Claude Code response (default 200
+    output tokens — medium response length). A model with great TTFT but
+    abnormally slow throughput gets penalized just like one with poor TTFT
+    — both leave the user staring at the screen.
+
+    The tok/s floor (10/s) prevents noisy probe measurements from trashing
+    a model. With max_tokens=16 probes we routinely see 1-3 tok/s for models
+    that stream at 50-200 tok/s in production; the floor stops that from
+    dominating the ranking.
+
+    If tok_per_s is missing entirely, falls back to combined_score (TTFT-only).
+    """
+    if code is None or ttft_ms is None:
+        return None
+    if tok_per_s is None or tok_per_s <= 0:
+        return combined_score(code, ttft_ms, tau_ms)
+    effective_tps = max(tok_per_s, _TOK_PER_S_FLOOR)
+    effective_ms = ttft_ms + (output_tokens / effective_tps) * 1000.0
+    # effective_ms is typically 10-30x larger than ttft_ms (most of the time
+    # is spent generating tokens, not waiting for the first one). Scale tau
+    # by 10 internally so the same --tau value produces sensible numbers for
+    # both combined (TTFT-only) and smart (TTFT + output time). With tau=3000,
+    # smart's effective tau is 30000ms — a 30s end-to-end response keeps 37%.
+    smart_tau = tau_ms * 10
+    return code * math.exp(-effective_ms / smart_tau)

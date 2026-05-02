@@ -47,10 +47,21 @@ def write_env_key(path: Path, key: str, value: str) -> None:
     path.write_text(txt, encoding="utf-8")
 
 
-def resolve_api_key() -> Optional[str]:
-    """Look up the NVIDIA key from env vars, then the .env file."""
-    for var in ("NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
-        v = os.environ.get(var)
+def resolve_api_key(provider: str = "nvidia-nim") -> Optional[str]:
+    """Look up the API key for `provider` from env vars, then the .env file.
+
+    nvidia-nim   ->  $NVIDIA_NIM_API_KEY > $NVIDIA_API_KEY > .env NVIDIA_NIM_API_KEY
+    openrouter   ->  $OPENROUTER_API_KEY > .env OPENROUTER_API_KEY
+    """
+    if provider == "nvidia-nim":
+        for var in ("NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"):
+            v = os.environ.get(var)
+            if v:
+                return v
+        return read_env_key(env_path(), "NVIDIA_NIM_API_KEY")
+    if provider == "openrouter":
+        v = os.environ.get("OPENROUTER_API_KEY")
         if v:
             return v
-    return read_env_key(env_path(), "NVIDIA_NIM_API_KEY")
+        return read_env_key(env_path(), "OPENROUTER_API_KEY")
+    return None

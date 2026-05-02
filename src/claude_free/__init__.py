@@ -12,7 +12,7 @@ If you're reading this in development, you can run the package directly:
 The single-file version is what `claude-free` invokes in production.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Last-refreshed marker for the BENCHMARKS table — keep in sync with
 # benchmarks.py. Used by the build script to stamp the generated file.
